@@ -17,7 +17,7 @@ import base64
 import time
 from urllib.parse import urlparse
 
-# ===== Конфигурация панели =====
+# ===== Конфигурация панели (поправьте под себя перед первым запуском) =====
 
 PANEL_PORT = 8091
 PANEL_USER_DEFAULT = "admin"
@@ -33,6 +33,8 @@ DNSCRYPT_BIN = "/opt/sbin/dnscrypt-proxy"
 
 ODOH_SERVERS_MD = "/opt/etc/odoh-servers.md"
 ODOH_RELAYS_MD = "/opt/etc/odoh-relays.md"
+
+MONITORING_UI_PORT = 8090  # порт встроенного [monitoring_ui] dnscrypt-proxy2
 
 VALIDATE_TEST_PORT = 59999
 VALIDATE_TIMEOUT = 4  # секунд на тестовый запуск перед проверкой на FATAL
@@ -198,7 +200,8 @@ INDEX_HTML = """<!DOCTYPE html>
   nav { display:flex; gap:4px; padding:0 20px; background:#1c1f26; }
   nav button { background:none; border:none; color:#9aa0aa; padding:12px 16px; cursor:pointer; font-size:14px; border-bottom:2px solid transparent; }
   nav button.active { color:#fff; border-bottom-color:#4f8cff; }
-  main { padding:20px; max-width:900px; margin:0 auto; }
+  main { padding:20px; max-width:1200px; margin:0 auto; }
+  main.full { padding:0; max-width:none; }
   .tab { display:none; }
   .tab.active { display:block; }
   .card { background:#1c1f26; border:1px solid #2a2e37; border-radius:8px; padding:16px; margin-bottom:16px; }
@@ -210,8 +213,9 @@ INDEX_HTML = """<!DOCTYPE html>
   button.action:hover { background:#343a46; }
   button.primary { background:#2857c4; border-color:#2857c4; }
   button.primary:hover { background:#3567df; }
-  textarea { width:100%; height:420px; background:#0f1114; color:#d8ffb0; border:1px solid #2a2e37; border-radius:6px; padding:10px; font-family:monospace; font-size:13px; box-sizing:border-box; }
-  pre#logbox { background:#0f1114; border:1px solid #2a2e37; border-radius:6px; padding:10px; height:420px; overflow-y:auto; font-size:12px; white-space:pre-wrap; }
+  textarea { width:100%; height:640px; background:#0f1114; color:#d8ffb0; border:1px solid #2a2e37; border-radius:6px; padding:10px; font-family:monospace; font-size:13px; box-sizing:border-box; resize:vertical; }
+  pre#logbox { background:#0f1114; border:1px solid #2a2e37; border-radius:6px; padding:10px; height:500px; overflow-y:auto; font-size:12px; white-space:pre-wrap; }
+  iframe#monitor-frame { width:100%; height:calc(100vh - 57px); border:none; display:block; background:#fff; }
   select { background:#0f1114; color:#e6e6e6; border:1px solid #2a2e37; border-radius:6px; padding:6px; }
   select[multiple] { height:140px; width:100%; }
   label { font-size:13px; color:#9aa0aa; display:block; margin-bottom:4px; }
@@ -226,6 +230,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <header><h1>dnscrypt-proxy2 — панель управления</h1></header>
 <nav>
   <button class="tabbtn active" data-tab="dash">Дашборд</button>
+  <button class="tabbtn" data-tab="monitor">Мониторинг</button>
   <button class="tabbtn" data-tab="route">Relay / Target</button>
   <button class="tabbtn" data-tab="config">Редактор toml</button>
   <button class="tabbtn" data-tab="logs">Логи</button>
@@ -251,6 +256,10 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="tab" id="tab-monitor">
+    <iframe id="monitor-frame" src="about:blank"></iframe>
+  </div>
+
   <div class="tab" id="tab-route">
     <div class="card">
       <label>Target ODoH-сервер</label>
@@ -267,9 +276,15 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <div class="tab" id="tab-config">
     <div class="card">
+      <p class="kv" style="margin-top:0;">
+        «Обновить из файла» — перечитывает toml с диска в это поле (отменяет несохранённые правки).
+        «Проверить конфигурацию» — тестирует синтаксис без сохранения и рестарта.
+        «Проверить и сохранить» — при успехе сохраняет и перезапускает сервис.
+      </p>
       <textarea id="config-text"></textarea>
       <div class="row" style="margin-top:10px;">
         <button class="action" onclick="loadConfig()">Обновить из файла</button>
+        <button class="action" onclick="validateConfig()">Проверить конфигурацию</button>
         <button class="action primary" onclick="saveConfig()">Проверить и сохранить (+рестарт)</button>
       </div>
       <div id="config-msg"></div>
@@ -307,10 +322,19 @@ function switchTab(name) {
   document.querySelectorAll('.tabbtn').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   document.querySelector(`.tabbtn[data-tab="${name}"]`).classList.add('active');
+  document.querySelector('main').classList.toggle('full', name === 'monitor');
   if (name === 'logs') { loadLogs(); logsTimer = setInterval(loadLogs, 3000); }
   else { clearInterval(logsTimer); }
   if (name === 'config') loadConfig();
   if (name === 'route') loadRouteOptions();
+  if (name === 'monitor') loadMonitor();
+}
+
+function loadMonitor() {
+  const frame = document.getElementById('monitor-frame');
+  if (frame.src === 'about:blank' || !frame.src) {
+    frame.src = `http://${location.hostname}:8090/`;
+  }
 }
 document.querySelectorAll('.tabbtn').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
 
@@ -340,9 +364,40 @@ async function doAction(action) {
 }
 
 async function loadConfig() {
-  const r = await fetch('/api/config');
-  document.getElementById('config-text').value = await r.text();
-  document.getElementById('config-msg').textContent = '';
+  const msg = document.getElementById('config-msg');
+  msg.textContent = 'загружаю...';
+  msg.className = 'msg';
+  try {
+    const r = await fetch('/api/config');
+    if (!r.ok) {
+      msg.textContent = `Ошибка загрузки: HTTP ${r.status}`;
+      msg.className = 'msg err';
+      return;
+    }
+    const text = await r.text();
+    document.getElementById('config-text').value = text;
+    msg.textContent = `Загружено (${text.length} байт)`;
+    msg.className = 'msg ok';
+  } catch (e) {
+    msg.textContent = 'Ошибка сети: ' + e.message;
+    msg.className = 'msg err';
+  }
+}
+
+async function validateConfig() {
+  const msg = document.getElementById('config-msg');
+  msg.textContent = 'проверяю...';
+  msg.className = 'msg';
+  const text = document.getElementById('config-text').value;
+  try {
+    const r = await fetch('/api/config/validate', {method:'POST', body: text});
+    const j = await r.json();
+    msg.textContent = j.output;
+    msg.className = 'msg ' + (j.ok ? 'ok' : 'err');
+  } catch (e) {
+    msg.textContent = 'Ошибка сети: ' + e.message;
+    msg.className = 'msg err';
+  }
 }
 
 async function saveConfig() {
@@ -350,11 +405,16 @@ async function saveConfig() {
   msg.textContent = 'проверяю конфиг...';
   msg.className = 'msg';
   const text = document.getElementById('config-text').value;
-  const r = await fetch('/api/config?restart=1', {method:'POST', body: text});
-  const j = await r.json();
-  msg.textContent = j.output || (j.ok ? 'Сохранено и перезапущено' : 'Ошибка, конфиг НЕ применён');
-  msg.className = 'msg ' + (j.ok ? 'ok' : 'err');
-  if (j.ok) loadStatus();
+  try {
+    const r = await fetch('/api/config?restart=1', {method:'POST', body: text});
+    const j = await r.json();
+    msg.textContent = j.output || (j.ok ? 'Сохранено и перезапущено' : 'Ошибка, конфиг НЕ применён');
+    msg.className = 'msg ' + (j.ok ? 'ok' : 'err');
+    if (j.ok) loadStatus();
+  } catch (e) {
+    msg.textContent = 'Ошибка сети: ' + e.message;
+    msg.className = 'msg err';
+  }
 }
 
 async function loadRouteOptions() {
@@ -493,7 +553,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
 
-        if parsed.path == "/api/config":
+        if parsed.path == "/api/config/validate":
+            text = body.decode("utf-8", errors="ignore")
+            ok, out = validate_config_text(text)
+            self._send_json({"ok": ok, "output": out[-3000:] if not ok else "Конфиг валиден, ошибок не найдено."})
+
+        elif parsed.path == "/api/config":
             text = body.decode("utf-8", errors="ignore")
             ok, out = validate_config_text(text)
             if not ok:
