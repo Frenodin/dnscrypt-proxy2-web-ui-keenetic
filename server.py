@@ -72,6 +72,98 @@ def save_auth(auth):
 PANEL_AUTH = load_auth()
 
 
+def get_current_route():
+    """Извлекает текущий server_names и routes.via из toml."""
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return {"server_name": None, "relays": []}
+    m = re.search(r"server_names\s*=\s*\[\s*'([^']+)'", content)
+    server_name = m.group(1) if m else None
+    relays = []
+    m2 = re.search(r"routes\s*=\s*\[.*?via\s*=\s*\[([^\]]*)\]", content, re.DOTALL)
+    if m2:
+        relays = re.findall(r"'([^']+)'", m2.group(1))
+    return {"server_name": server_name, "relays": relays}
+
+
+def build_route_content(content, server_name, relays):
+    """Подставляет server_names/routes в текст toml-конфига."""
+    content = re.sub(
+        r"server_names\s*=\s*\[[^\]]*\]",
+        f"server_names = ['{server_name}']",
+        content, count=1,
+    )
+    relays_str = ", ".join(f"'{r}'" for r in relays)
+    new_route_block = (
+        "routes = [\n"
+        f"    {{ server_name='{server_name}', via=[{relays_str}] }}\n"
+        "]"
+    )
+    # Важно: .*? останавливается на ПЕРВОЙ встреченной ']', а она есть уже
+    # внутри via=[...] — поэтому матчим закрывающую скобку, стоящую в
+    # начале отдельной строки (так внешний массив всегда оформлен и в
+    # исходном, и в сгенерированном конфиге), а не первую попавшуюся.
+    if re.search(r"routes\s*=\s*\[.*?\n\s*\]", content, re.DOTALL):
+        content = re.sub(
+            r"routes\s*=\s*\[.*?\n\s*\]",
+            new_route_block.replace("\\", "\\\\"),
+            content, count=1, flags=re.DOTALL,
+        )
+    else:
+        content += "\n[anonymized_dns]\n" + new_route_block + "\nskip_incompatible = true\n"
+    return content
+
+
+def ping_route(server_name, relays):
+    """Пробное подключение через конкретную связку target+relay на отдельном
+    порту (не мешает рабочему инстансу). Возвращает (ok, rtt_or_None, detail)."""
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return False, None, "Конфиг не найден"
+
+    content = build_route_content(content, server_name, relays)
+    content = re.sub(
+        r"listen_addresses\s*=\s*\[[^\]]*\]",
+        f"listen_addresses = ['127.0.0.1:{VALIDATE_TEST_PORT}']",
+        content, count=1,
+    )
+
+    test_path = CONFIG_PATH + ".ping-tmp"
+    with open(test_path, "w") as f:
+        f.write(content)
+
+    proc = subprocess.Popen(
+        [DNSCRYPT_BIN, "-config", test_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+    try:
+        out, _ = proc.communicate(timeout=7)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            out, _ = proc.communicate(timeout=2)
+        except Exception:
+            out = b""
+            proc.kill()
+
+    try:
+        os.remove(test_path)
+    except OSError:
+        pass
+
+    text_out = out.decode(errors="ignore")
+    if "FATAL" in text_out:
+        return False, None, text_out[-500:]
+    m = re.search(rf"\[{re.escape(server_name)}\] OK \(.*?\) - rtt: (\S+)", text_out)
+    if m:
+        return True, m.group(1), "OK"
+    return False, None, text_out[-500:] if text_out else "Нет ответа за отведённое время"
+
+
 def get_status():
     status = {"running": False, "pid": None, "server_name": None,
               "relay_name": None, "rtt": None}
@@ -107,19 +199,31 @@ def get_status():
 
 
 def parse_md_names(path, prefix_filter=None):
-    """Достаёт имена серверов/релеев из ## заголовков odoh-*.md файлов."""
-    names = []
+    """Достаёт имена и краткие описания серверов/релеев из ## заголовков
+    odoh-*.md файлов. Возвращает список {"name":..., "desc":...}."""
+    items = []
     try:
         with open(path, "r", errors="ignore") as f:
             content = f.read()
     except FileNotFoundError:
-        return names
-    for m in re.finditer(r"^## (\S+)\s*$", content, re.MULTILINE):
-        name = m.group(1)
+        return items
+    blocks = re.split(r"^## ", content, flags=re.MULTILINE)[1:]
+    for block in blocks:
+        lines = block.splitlines()
+        if not lines:
+            continue
+        name = lines[0].strip()
         if prefix_filter and not name.startswith(prefix_filter):
             continue
-        names.append(name)
-    return names
+        desc = ""
+        for line in lines[1:]:
+            line = line.strip()
+            if not line or line.startswith("[#") or line.startswith("sdns://"):
+                continue
+            desc = line
+            break
+        items.append({"name": name, "desc": desc[:120]})
+    return items
 
 
 def validate_config_text(text):
@@ -262,12 +366,14 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <div class="tab" id="tab-route">
     <div class="card">
+      <div id="current-route-info" class="kv" style="margin-bottom:14px; font-size:14px;">загрузка текущих настроек...</div>
       <label>Target ODoH-сервер</label>
-      <select id="sel-server"></select>
-      <br><br>
+      <select id="sel-server" size="8" style="width:100%;"></select>
+      <div id="server-desc" class="kv" style="margin:6px 0 16px;"></div>
       <label>Relay(и) — можно выбрать несколько (Ctrl+клик)</label>
       <select id="sel-relays" multiple></select>
       <div class="row" style="margin-top:12px;">
+        <button class="action" onclick="pingRoute()">Проверить доступность</button>
         <button class="action primary" onclick="applyRoute()">Применить и перезапустить</button>
       </div>
       <div id="route-msg"></div>
@@ -417,15 +523,61 @@ async function saveConfig() {
   }
 }
 
+let serverList = [];
+
 async function loadRouteOptions() {
-  const [servers, relays] = await Promise.all([
+  const [servers, relays, current] = await Promise.all([
     fetch('/api/servers').then(r => r.json()),
-    fetch('/api/relays').then(r => r.json())
+    fetch('/api/relays').then(r => r.json()),
+    fetch('/api/current-route').then(r => r.json())
   ]);
+  serverList = servers;
+
   const selServer = document.getElementById('sel-server');
-  selServer.innerHTML = servers.map(s => `<option value="${s}">${s}</option>`).join('');
+  selServer.innerHTML = servers.map(s =>
+    `<option value="${s.name}" ${s.name === current.server_name ? 'selected' : ''}>${s.name}${s.name === current.server_name ? '  ← текущий' : ''}</option>`
+  ).join('');
+
   const selRelays = document.getElementById('sel-relays');
-  selRelays.innerHTML = relays.map(r => `<option value="${r}">${r}</option>`).join('');
+  selRelays.innerHTML = relays.map(r =>
+    `<option value="${r.name}" ${current.relays.includes(r.name) ? 'selected' : ''}>${r.name}${current.relays.includes(r.name) ? '  ← текущий' : ''}</option>`
+  ).join('');
+
+  const info = document.getElementById('current-route-info');
+  info.innerHTML = current.server_name
+    ? `Сейчас настроено в конфиге: <b>${current.server_name}</b> через <b>${current.relays.join(', ') || '—'}</b>`
+    : 'Маршрут ещё не настроен';
+
+  showServerDesc();
+  selServer.onchange = showServerDesc;
+}
+
+function showServerDesc() {
+  const sel = document.getElementById('sel-server');
+  const found = serverList.find(s => s.name === sel.value);
+  document.getElementById('server-desc').textContent = found && found.desc ? found.desc : '';
+}
+
+async function pingRoute() {
+  const msg = document.getElementById('route-msg');
+  const server_name = document.getElementById('sel-server').value;
+  const relays = Array.from(document.getElementById('sel-relays').selectedOptions).map(o => o.value);
+  if (!server_name || relays.length === 0) {
+    msg.textContent = 'Выберите target и хотя бы один relay';
+    msg.className = 'msg err';
+    return;
+  }
+  msg.textContent = 'проверяю подключение (может занять до 7 сек)...';
+  msg.className = 'msg';
+  try {
+    const r = await fetch('/api/ping-route', {method:'POST', body: JSON.stringify({server_name, relays})});
+    const j = await r.json();
+    msg.textContent = j.output;
+    msg.className = 'msg ' + (j.ok ? 'ok' : 'err');
+  } catch (e) {
+    msg.textContent = 'Ошибка сети: ' + e.message;
+    msg.className = 'msg err';
+  }
 }
 
 async function applyRoute() {
@@ -543,6 +695,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(parse_md_names("/opt/etc/odoh-servers.md"))
         elif path == "/api/relays":
             self._send_json(parse_md_names("/opt/etc/odoh-relays.md"))
+        elif path == "/api/current-route":
+            self._send_json(get_current_route())
         else:
             self._send(404, "not found")
 
@@ -582,6 +736,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ok, out = do_service_action(data.get("action", ""))
             self._send_json({"ok": ok, "output": out})
 
+        elif parsed.path == "/api/ping-route":
+            try:
+                data = json.loads(body.decode("utf-8"))
+                server_name = data["server_name"]
+                relays = data["relays"]
+            except Exception:
+                return self._send_json({"ok": False, "output": "bad request"})
+            ok, rtt, detail = ping_route(server_name, relays)
+            if ok:
+                self._send_json({"ok": True, "output": f"Успех, RTT: {rtt}"})
+            else:
+                self._send_json({"ok": False, "output": "Не удалось подключиться:\n" + detail})
+
         elif parsed.path == "/api/apply-route":
             try:
                 data = json.loads(body.decode("utf-8"))
@@ -593,27 +760,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with open(CONFIG_PATH, "r") as f:
                 content = f.read()
 
-            content = re.sub(
-                r"server_names\s*=\s*\[[^\]]*\]",
-                f"server_names = ['{server_name}']",
-                content, count=1,
-            )
-            relays_str = ", ".join(f"'{r}'" for r in relays)
-            new_route_block = (
-                "routes = [\n"
-                f"    {{ server_name='{server_name}', via=[{relays_str}] }}\n"
-                "]"
-            )
-            if re.search(r"routes\s*=\s*\[.*?\]", content, re.DOTALL):
-                content = re.sub(
-                    r"routes\s*=\s*\[.*?\]",
-                    new_route_block.replace("\\", "\\\\"),
-                    content, count=1, flags=re.DOTALL,
-                )
-            else:
-                content += (
-                    "\n[anonymized_dns]\n" + new_route_block + "\nskip_incompatible = true\n"
-                )
+            content = build_route_content(content, server_name, relays)
 
             ok, out = validate_config_text(content)
             if not ok:
